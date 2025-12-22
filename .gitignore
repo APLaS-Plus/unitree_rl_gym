@@ -1,3 +1,7 @@
+# APLaS version
+runs*/
+3rd/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -45,6 +45,18 @@ class GO2RoughCfg( LeggedRobotCfg ):
             torques = -0.0002
             dof_pos_limits = -10.0
 
+            # for SAC
+            orientation = -2.0
+            base_height = -2.0
+            lin_vel_z = -2.0
+            ang_vel_xy = -0.2
+            collision = -2.0
+            # termination = -2
+            # feet_air_time = 2
+            # action_rate = -0.1
+            # dof_acc = -1e6
+            ###########
+
 class GO2RoughCfgPPO( LeggedRobotCfgPPO ):
     class algorithm( LeggedRobotCfgPPO.algorithm ):
         entropy_coef = 0.01
