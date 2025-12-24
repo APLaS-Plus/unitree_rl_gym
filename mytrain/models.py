@@ -246,28 +246,6 @@ def get_activation(act_name):
 
 
 class PPOActorCritic(nn.Module):
-    """
-    自定义 PPO Actor-Critic 网络，兼容 rsl_rl.PPO 算法
-    
-    特性:
-    - 支持多种激活函数 (elu, mish, relu, gelu, etc.)
-    - 可选的 LayerNorm
-    - 正交初始化权重
-    - 与 rsl_rl.PPO 完全兼容的接口
-    
-    Usage:
-        actor_critic = PPOActorCritic(
-            num_actor_obs=48,
-            num_critic_obs=48,
-            num_actions=12,
-            actor_hidden_dims=[512, 512, 256],
-            critic_hidden_dims=[512, 512, 256],
-            activation='mish',
-            use_layer_norm=False,
-            init_noise_std=1.0,
-        )
-    """
-    is_recurrent = False  # rsl_rl 需要这个属性
     
     def __init__(
         self,
@@ -276,14 +254,12 @@ class PPOActorCritic(nn.Module):
         num_actions: int,
         actor_hidden_dims: list = [256, 256, 256],
         critic_hidden_dims: list = [256, 256, 256],
-        activation: str = 'elu',
+        activation: str = 'mish',
         init_noise_std: float = 1.0,
         use_layer_norm: bool = False,
         ortho_init: bool = True,
         **kwargs
     ):
-        if kwargs:
-            print(f"PPOActorCritic: 忽略未知参数: {list(kwargs.keys())}")
         super(PPOActorCritic, self).__init__()
         
         self.num_actor_obs = num_actor_obs
@@ -329,17 +305,9 @@ class PPOActorCritic(nn.Module):
         self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         self.distribution = None
         
-        # 禁用分布验证以加速
-        torch.distributions.Normal.set_default_validate_args = False
-        
         # 正交初始化
         if ortho_init:
             self._init_weights()
-        
-        print(f"PPOActorCritic 网络结构:")
-        print(f"  Actor: {self.actor}")
-        print(f"  Critic: {self.critic}")
-        print(f"  初始噪声标准差: {init_noise_std}")
     
     def _init_weights(self):
         """正交初始化权重"""
@@ -358,14 +326,7 @@ class PPOActorCritic(nn.Module):
             nn.init.orthogonal_(self.actor[-1].weight, gain=0.01)
         if isinstance(self.critic[-1], nn.Linear):
             nn.init.orthogonal_(self.critic[-1].weight, gain=1.0)
-    
-    def reset(self, dones=None):
-        """重置隐藏状态 (非循环网络不需要)"""
-        pass
-    
-    def forward(self):
-        raise NotImplementedError("Use act() or evaluate() instead")
-    
+
     # ============ 分布相关属性 (rsl_rl 需要) ============
     @property
     def action_mean(self):
@@ -378,6 +339,9 @@ class PPOActorCritic(nn.Module):
     @property
     def entropy(self):
         return self.distribution.entropy().sum(dim=-1)
+    
+    def forward(self):
+        raise NotImplementedError("Use act() or evaluate() instead")
     
     # ============ 核心方法 ============
     def update_distribution(self, observations):
@@ -406,3 +370,278 @@ class PPOActorCritic(nn.Module):
     def save_state_dict(self, path: Path):
         os.makedirs(str(path.parent), exist_ok=True)
         torch.save(self.state_dict(), path)
+
+class PPGActorCritic(nn.Module):
+    def __init__(
+        self,
+        num_actor_obs: int,
+        num_critic_obs: int,
+        num_actions: int,
+        actor_hidden_dims: list = [256, 256, 256],
+        critic_hidden_dims: list = [256, 256, 256],
+        activation: str = 'mish',
+        init_noise_std: float = 1.0,
+        use_layer_norm: bool = False,
+        ortho_init: bool = True,
+        **kwargs
+    ):
+        super(PPGActorCritic, self).__init__()
+        
+        self.num_actor_obs = num_actor_obs
+        self.num_critic_obs = num_critic_obs
+        self.num_actions = num_actions
+        
+        # 激活函数
+        act_fn = get_activation(activation)
+        
+        # ============ Actor 网络 ============
+        actor_layers = []
+        actor_layers.append(nn.Linear(num_actor_obs, actor_hidden_dims[0]))
+        if use_layer_norm:
+            actor_layers.append(nn.LayerNorm(actor_hidden_dims[0]))
+        actor_layers.append(act_fn)
+        
+        for i in range(len(actor_hidden_dims) - 1):
+            actor_layers.append(nn.Linear(actor_hidden_dims[i], actor_hidden_dims[i + 1]))
+            if use_layer_norm:
+                actor_layers.append(nn.LayerNorm(actor_hidden_dims[i + 1]))
+            actor_layers.append(get_activation(activation))
+        
+        # actor_layers.append(nn.Linear(actor_hidden_dims[-1], num_actions))
+        self.actor_feature_extractor = nn.Sequential(*actor_layers)
+
+        self.actor_head = nn.Linear(actor_hidden_dims[-1], num_actions)
+        self.actor_aux_value_head = nn.Linear(actor_hidden_dims[-1], 1)
+        
+        # ============ Critic 网络 ============
+        critic_layers = []
+        critic_layers.append(nn.Linear(num_critic_obs, critic_hidden_dims[0]))
+        if use_layer_norm:
+            critic_layers.append(nn.LayerNorm(critic_hidden_dims[0]))
+        critic_layers.append(get_activation(activation))
+        
+        for i in range(len(critic_hidden_dims) - 1):
+            critic_layers.append(nn.Linear(critic_hidden_dims[i], critic_hidden_dims[i + 1]))
+            if use_layer_norm:
+                critic_layers.append(nn.LayerNorm(critic_hidden_dims[i + 1]))
+            critic_layers.append(get_activation(activation))
+        
+        critic_layers.append(nn.Linear(critic_hidden_dims[-1], 1))
+        self.critic = nn.Sequential(*critic_layers)
+        
+        # ============ 动作噪声 (可学习的标准差) ============
+        self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        self.distribution = None
+        
+        # 正交初始化
+        if ortho_init:
+            self._init_weights()
+
+    def _init_weights(self):
+        """正交初始化权重"""
+        for module in self.actor_feature_extractor.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+                nn.init.constant_(module.bias, 0.0)
+        
+        if isinstance(self.actor_head, nn.Linear):
+            nn.init.orthogonal_(self.actor_head.weight, gain=0.01)
+        
+        if isinstance(self.actor_aux_value_head, nn.Linear):
+            nn.init.orthogonal_(self.actor_aux_value_head.weight, gain=1.0)
+        
+        for module in self.critic.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+                nn.init.constant_(module.bias, 0.0)
+        
+        # 最后一层使用更小的增益
+        # if isinstance(self.actor[-1], nn.Linear):
+        #     nn.init.orthogonal_(self.actor[-1].weight, gain=0.01)
+        if isinstance(self.critic[-1], nn.Linear):
+            nn.init.orthogonal_(self.critic[-1].weight, gain=1.0)
+
+    # ============ 分布相关属性 (rsl_rl 需要) ============
+    @property
+    def action_mean(self):
+        return self.distribution.mean
+    
+    @property
+    def action_std(self):
+        return self.distribution.stddev
+    
+    @property
+    def entropy(self):
+        return self.distribution.entropy().sum(dim=-1)
+
+    def forward(self):
+        raise NotImplementedError("Use act() or evaluate() instead")
+    
+    # ============ 核心方法 ============
+    def update_distribution(self, observations):
+        """更新动作分布"""
+        feature = self.actor_feature_extractor(observations)
+        mean = self.actor_head(feature)
+        self.distribution = torch.distributions.Normal(mean, self.std)
+    
+    def act(self, observations, **kwargs):
+        """采样动作 (训练时使用)"""
+        self.update_distribution(observations)
+        return self.distribution.sample()
+
+    def aux_value(self, observations):
+        """辅助价值"""
+        feature = self.actor_feature_extractor(observations)
+        return self.actor_aux_value_head(feature)
+    
+    def get_actions_log_prob(self, actions):
+        """计算动作的 log 概率"""
+        return self.distribution.log_prob(actions).sum(dim=-1)
+    
+    def act_inference(self, observations):
+        """推理时使用 (确定性动作)"""
+        feature = self.actor_feature_extractor(observations)
+        return self.actor_head(feature)
+    
+    def evaluate(self, critic_observations, **kwargs):
+        """评估状态价值"""
+        return self.critic(critic_observations)
+    
+    # ============ 保存/加载 ============
+    def save_state_dict(self, path: Path):
+        os.makedirs(str(path.parent), exist_ok=True)
+        torch.save(self.state_dict(), path)
+    
+
+class RolloutBuffer:
+    """
+    存储 rollout 数据的 buffer，用于 PPO 训练
+    支持 GAE 计算
+    """
+
+    def __init__(
+        self, num_envs: int, n_steps: int, obs_dim: int, action_dim: int, device: str
+    ):
+        self.num_envs = num_envs
+        self.n_steps = n_steps
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+        self.device = device
+
+        # 预分配存储空间
+        self.observations = torch.zeros(
+            (n_steps, num_envs, obs_dim), dtype=torch.float32, device=device
+        )
+        self.actions = torch.zeros(
+            (n_steps, num_envs, action_dim), dtype=torch.float32, device=device
+        )
+        self.rewards = torch.zeros(
+            (n_steps, num_envs), dtype=torch.float32, device=device
+        )
+        self.dones = torch.zeros(
+            (n_steps, num_envs), dtype=torch.float32, device=device
+        )
+        self.values = torch.zeros(
+            (n_steps, num_envs), dtype=torch.float32, device=device
+        )
+        self.log_probs = torch.zeros(
+            (n_steps, num_envs), dtype=torch.float32, device=device
+        )
+
+        # GAE 计算结果
+        self.advantages = torch.zeros(
+            (n_steps, num_envs), dtype=torch.float32, device=device
+        )
+        self.returns = torch.zeros(
+            (n_steps, num_envs), dtype=torch.float32, device=device
+        )
+
+        self.step = 0
+
+    def add(self, obs, action, reward, done, value, log_prob):
+        """添加一步数据"""
+        self.observations[self.step] = obs
+        self.actions[self.step] = action
+        self.rewards[self.step] = reward
+        self.dones[self.step] = done
+        self.values[self.step] = value.squeeze(-1)
+        self.log_probs[self.step] = log_prob
+        self.step += 1
+
+    def compute_gae(self, last_value: torch.Tensor, gamma: float, gae_lambda: float):
+        """
+        计算 Generalized Advantage Estimation (GAE)
+
+        Args:
+            last_value: 最后一个状态的 value 估计
+            gamma: 折扣因子
+            gae_lambda: GAE lambda 参数
+        """
+        last_value = last_value.squeeze(-1)
+        last_gae = 0
+
+        for step in reversed(range(self.n_steps)):
+            if step == self.n_steps - 1:
+                next_non_terminal = 1.0 - self.dones[step]
+                next_value = last_value
+            else:
+                next_non_terminal = 1.0 - self.dones[step]
+                next_value = self.values[step + 1]
+
+            # TD error: δ = r + γ * V(s') * (1 - done) - V(s)
+            delta = (
+                self.rewards[step]
+                + gamma * next_value * next_non_terminal
+                - self.values[step]
+            )
+
+            # GAE: A = δ + γ * λ * (1 - done) * A'
+            last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
+            self.advantages[step] = last_gae
+
+        # Returns = Advantages + Values
+        self.returns = self.advantages + self.values
+
+    def get_batches(self, num_mini_batches: int):
+        """
+        生成随机打乱的 mini-batches
+
+        Args:
+            num_mini_batches: mini-batch 数量
+
+        Yields:
+            (obs_batch, actions_batch, old_log_probs_batch, advantages_batch, returns_batch)
+        """
+        batch_size = self.num_envs * self.n_steps
+        mini_batch_size = batch_size // num_mini_batches
+
+        # 展平所有数据
+        obs_flat = self.observations.reshape(-1, self.obs_dim)
+        actions_flat = self.actions.reshape(-1, self.action_dim)
+        log_probs_flat = self.log_probs.reshape(-1)
+        advantages_flat = self.advantages.reshape(-1)
+        returns_flat = self.returns.reshape(-1)
+
+        # 标准化 advantages
+        advantages_flat = (advantages_flat - advantages_flat.mean()) / (
+            advantages_flat.std() + 1e-8
+        )
+
+        # 随机打乱
+        indices = torch.randperm(batch_size, device=self.device)
+
+        for start in range(0, batch_size, mini_batch_size):
+            end = start + mini_batch_size
+            batch_indices = indices[start:end]
+
+            yield (
+                obs_flat[batch_indices],
+                actions_flat[batch_indices],
+                log_probs_flat[batch_indices],
+                advantages_flat[batch_indices],
+                returns_flat[batch_indices],
+            )
+
+    def reset(self):
+        """重置 buffer"""
+        self.step = 0

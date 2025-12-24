@@ -1,7 +1,7 @@
 """
-PPO 训练脚本 (GAE 版本) - 适配 legged_gym 环境
+PPG 训练脚本 (GAE 版本) - 适配 legged_gym 环境
 
-使用自定义 GAE-PPO 算法进行训练，用于与 SAC 算法对比实验
+使用自定义 GAE-PPG 算法进行训练，用于与 SAC 算法对比实验
 """
 
 import os
@@ -25,7 +25,7 @@ from argparse import Namespace
 from torch.utils.tensorboard import SummaryWriter
 from rich.progress import track
 
-from models import PPOActorCritic, device, RolloutBuffer
+from models import PPGActorCritic, device, RolloutBuffer
 
 # ============================================
 # 配置参数
@@ -62,9 +62,14 @@ max_grad_norm = 1.0  # 梯度裁剪
 gae_lambda = 0.97  # GAE lambda
 init_noise_std = 1.0  # 初始动作噪声标准差
 
+# PPG
+aux_update_freq = 32
+n_aux_epochs = 6
+beta_clone = 1
+
 # 路径设置
 ROOT_PATH = Path(__file__).parent.resolve()
-runs_base_path = ROOT_PATH / "runs_ppo"
+runs_base_path = ROOT_PATH / "runs_ppg"
 os.makedirs(str(runs_base_path), exist_ok=True)
 
 run_num = 1
@@ -128,7 +133,7 @@ def main():
     print(f"学习率调度: {learning_rate_start} -> {learning_rate_end} (线性衰减)")
 
     # 创建 Actor-Critic 网络
-    actor_critic = PPOActorCritic(
+    actor_critic = PPGActorCritic(
         num_actor_obs=obs_dim,
         num_critic_obs=obs_dim,
         num_actions=action_dim,
@@ -138,8 +143,17 @@ def main():
         init_noise_std=init_noise_std,
     ).to(device)
 
-    # 优化器
-    optimizer = torch.optim.Adam(actor_critic.parameters(), lr=learning_rate_start)
+    # 优化器 (分离 Actor 和 Critic)
+    actor_params = (
+        list(actor_critic.actor_feature_extractor.parameters())
+        + list(actor_critic.actor_head.parameters())
+        + list(actor_critic.actor_aux_value_head.parameters())
+        + [actor_critic.std]
+    )
+    critic_params = list(actor_critic.critic.parameters())
+
+    actor_optimizer = torch.optim.Adam(actor_params, lr=learning_rate_start)
+    critic_optimizer = torch.optim.Adam(critic_params, lr=learning_rate_start)
 
     # Rollout Buffer
     rollout_buffer = RolloutBuffer(
@@ -184,7 +198,9 @@ def main():
         # 更新学习率 (线性衰减)
         progress = update_idx / max_iterations
         current_lr = linear_schedule(learning_rate_start, learning_rate_end, progress)
-        for param_group in optimizer.param_groups:
+        for param_group in actor_optimizer.param_groups:
+            param_group["lr"] = current_lr
+        for param_group in critic_optimizer.param_groups:
             param_group["lr"] = current_lr
 
         # ============================================
@@ -271,12 +287,14 @@ def main():
         total_value_loss = 0
         total_entropy_loss = 0
         total_actor_loss = 0
-        total_critic_loss = 0
+        total_aux_value_loss = 0
+        total_aux_kl_loss = 0
         total_loss = 0
         total_kl = 0
         n_updates = 0
+        n_aux_updates = 0
 
-        for epoch in range(num_learning_epochs):
+        for epoch in range(1, num_learning_epochs + 1):
             for (
                 obs_batch,
                 actions_batch,
@@ -303,21 +321,54 @@ def main():
                 pg_loss = -torch.min(surr1, surr2).mean()
 
                 # Value Loss
-                value_loss = nn.functional.mse_loss(values, returns_batch)
+                value_loss = value_loss_coef + nn.functional.mse_loss(
+                    values, returns_batch
+                )
 
                 # Entropy Loss (鼓励探索)
-                entropy_loss = -entropy
+                entropy_loss = -entropy_coef * entropy
+
+                actor_loss = pg_loss + entropy_loss
 
                 # Total Loss
-                actor_loss = pg_loss + entropy_coef * entropy_loss
-                critic_loss = value_loss_coef * value_loss
-                loss = actor_loss + critic_loss
+                loss = pg_loss + value_loss + entropy_loss
 
-                # 反向传播
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(actor_critic.parameters(), max_grad_norm)
-                optimizer.step()
+                # 反向传播 (分离 Actor 和 Critic 更新)
+
+                critic_optimizer.zero_grad()
+                value_loss.backward()
+                nn.utils.clip_grad_norm_(critic_params, max_grad_norm)
+                critic_optimizer.step()
+
+                actor_optimizer.zero_grad()
+                actor_loss.backward()
+                nn.utils.clip_grad_norm_(actor_params, max_grad_norm)
+                actor_optimizer.step()
+
+                # Aux update
+                if epoch % aux_update_freq == 0:
+                    for _ in range(n_aux_epochs):
+                        new_aux_values = actor_critic.aux_value(obs_batch)
+
+                        aux_value_loss = nn.functional.mse_loss(
+                            new_aux_values, returns_batch
+                        )
+                        loss_kl = nn.functional.kl_div(
+                            nn.functional.log_softmax(new_log_probs, dim=-1),
+                            nn.functional.log_softmax(old_log_probs_batch, dim=-1),
+                            reduction="batchmean",
+                        )
+
+                        aux_total_loss = aux_value_loss + beta_clone * loss_kl
+
+                        actor_optimizer.zero_grad()
+                        aux_total_loss.backward()
+                        nn.utils.clip_grad_norm_(actor_params, max_grad_norm)
+                        actor_optimizer.step()
+
+                        total_aux_value_loss += aux_value_loss.item()
+                        total_aux_kl_loss += loss_kl.item()
+                        n_aux_updates += 1
 
                 # 计算 KL 散度 (近似 KL)
                 with torch.no_grad():
@@ -327,7 +378,6 @@ def main():
                 total_value_loss += value_loss.item()
                 total_entropy_loss += entropy_loss.item()
                 total_actor_loss += actor_loss.item()
-                total_critic_loss += critic_loss.item()
                 total_loss += loss.item()
                 total_kl += approx_kl
                 n_updates += 1
@@ -337,9 +387,14 @@ def main():
         mean_value_loss = total_value_loss / n_updates
         mean_entropy_loss = total_entropy_loss / n_updates
         mean_actor_loss = total_actor_loss / n_updates
-        mean_critic_loss = total_critic_loss / n_updates
         mean_total_loss = total_loss / n_updates
         mean_kl = total_kl / n_updates
+
+        # PPG aux loss
+        mean_aux_value_loss = (
+            total_aux_value_loss / n_aux_updates if n_aux_updates > 0 else 0
+        )
+        mean_aux_kl_loss = total_aux_kl_loss / n_aux_updates if n_aux_updates > 0 else 0
 
         learn_time = time.time() - learn_start
         tot_time += collection_time + learn_time
@@ -359,8 +414,11 @@ def main():
         writer.add_scalar("Loss/value", mean_value_loss, it)
         writer.add_scalar("Loss/entropy", mean_entropy_loss, it)
         writer.add_scalar("Loss/actor", mean_actor_loss, it)
-        writer.add_scalar("Loss/critic", mean_critic_loss, it)
         writer.add_scalar("Loss/total", mean_total_loss, it)
+
+        # PPG Aux Loss
+        writer.add_scalar("Loss/aux_value", mean_aux_value_loss, it)
+        writer.add_scalar("Loss/aux_kl", mean_aux_kl_loss, it)
 
         # Learning Rate
         writer.add_scalar("Loss/learning_rate", current_lr, it)
@@ -434,8 +492,9 @@ def main():
             log_string += f"{'Policy loss:':>{pad}} {mean_pg_loss:.4f}\n"
             log_string += f"{'Value loss:':>{pad}} {mean_value_loss:.4f}\n"
             log_string += f"{'Actor loss:':>{pad}} {mean_actor_loss:.4f}\n"
-            log_string += f"{'Critic loss:':>{pad}} {mean_critic_loss:.4f}\n"
             log_string += f"{'Entropy:':>{pad}} {-mean_entropy_loss:.4f}\n"
+            log_string += f"{'Aux value loss:':>{pad}} {mean_aux_value_loss:.4f}\n"
+            log_string += f"{'Aux KL loss:':>{pad}} {mean_aux_kl_loss:.4f}\n"
             log_string += f"{'Mean action noise std:':>{pad}} {mean_std:.4f}\n"
             log_string += f"{'KL divergence:':>{pad}} {mean_kl:.6f}\n"
             log_string += f"{'Learning rate:':>{pad}} {current_lr:.2e}\n"
@@ -491,7 +550,8 @@ def main():
                     "update_idx": update_idx,
                     "total_steps": total_steps,
                     "actor_critic": actor_critic.state_dict(),
-                    "optimizer": optimizer.state_dict(),
+                    "actor_optimizer": actor_optimizer.state_dict(),
+                    "critic_optimizer": critic_optimizer.state_dict(),
                 },
                 checkpoint_path / f"checkpoint_{update_idx}.pt",
             )
@@ -501,7 +561,8 @@ def main():
     torch.save(
         {
             "actor_critic": actor_critic.state_dict(),
-            "optimizer": optimizer.state_dict(),
+            "actor_optimizer": actor_optimizer.state_dict(),
+            "critic_optimizer": critic_optimizer.state_dict(),
         },
         model_save_path / "final_model.pt",
     )
